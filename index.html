@@ -1,0 +1,325 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>PDF Bank Statement to CSV</title>
+  <style>
+    :root { font-family: Arial, sans-serif; }
+    body { margin: 24px; max-width: 980px; }
+    .dropzone {
+      border: 2px dashed #888;
+      border-radius: 10px;
+      padding: 28px;
+      text-align: center;
+      background: #fafafa;
+      cursor: pointer;
+        position: relative;
+    }
+    .dropzone.dragover { background: #eef6ff; border-color: #1e73ff; }
+    .row { margin-top: 14px; }
+    textarea { width: 100%; min-height: 260px; font-family: Consolas, monospace; }
+    button { padding: 10px 14px; }
+    small { color: #555; }
+  </style>
+</head>
+<body>
+  <h1>PDF Bank Statement to CSV</h1>
+  <p>Drop a statement PDF below. The parser extracts lines that look like: <b>Date Description Amount [Balance]</b>.</p>
+
+    <div id="dropzone" class="dropzone">
+    <p><b>Drop PDF here</b> or click to choose</p>
+    <!-- Invisible native input overlays the dropzone so clicks reliably open the file chooser -->
+    <input id="fileInput" type="file" accept="application/pdf" style="position:absolute;top:0;left:0;width:100%;height:100%;opacity:0;cursor:pointer;" />
+    <small>No data leaves your machine. Processing is in-browser.</small>
+  </div>
+  <div style="margin-top:8px">
+    <button id="chooseBtn">Choose file</button>
+  </div>
+
+  <div class="row">
+    <button id="downloadBtn" disabled>Download CSV</button>
+    <span id="status" style="margin-left:10px;color:#333;"></span>
+  </div>
+
+  <div class="row">
+    <label for="preview"><b>CSV Preview</b></label>
+    <textarea id="preview" readonly></textarea>
+  </div>
+
+  <script>
+    const dropzone = document.getElementById('dropzone');
+    const fileInput = document.getElementById('fileInput');
+    const preview = document.getElementById('preview');
+    const downloadBtn = document.getElementById('downloadBtn');
+    const status = document.getElementById('status');
+
+    let latestCsv = '';
+    let latestFileName = 'statement.csv';
+
+    const pdfLibCandidates = [
+      {
+        lib: './lib/pdf.legacy.min.js',
+        worker: './lib/pdf.legacy.worker.min.js'
+      },
+      {
+        lib: 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js',
+        worker: 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js'
+      }
+    ];
+
+    function loadScript(src) {
+      return new Promise((resolve, reject) => {
+        const s = document.createElement('script');
+        s.src = src;
+        s.async = true;
+        s.onload = resolve;
+        s.onerror = reject;
+        document.head.appendChild(s);
+      });
+    }
+
+    async function ensurePdfJsLoaded() {
+      if (typeof window.pdfjsLib !== 'undefined') return true;
+
+      for (const candidate of pdfLibCandidates) {
+        try {
+          await loadScript(candidate.lib);
+          if (typeof window.pdfjsLib !== 'undefined') {
+            window.pdfjsLib.GlobalWorkerOptions.workerSrc = candidate.worker;
+            status.textContent = 'PDF library loaded. Select a PDF file.';
+            return true;
+          }
+        } catch {
+          // try next source
+        }
+      }
+
+      status.textContent = 'Could not load PDF library. If this is a local file, keep the lib folder next to index.html.';
+      return false;
+    }
+
+    status.textContent = 'Loading PDF library...';
+    ensurePdfJsLoaded();
+
+    // Prevent the browser from navigating to dropped files when user drops outside the dropzone
+    window.addEventListener('dragover', e => { e.preventDefault(); e.stopPropagation(); });
+    window.addEventListener('drop', e => { e.preventDefault(); e.stopPropagation(); });
+
+    dropzone.addEventListener('click', () => { console.log('dropzone clicked'); fileInput.click(); });
+    fileInput.addEventListener('change', e => {
+      const file = e.target.files?.[0];
+      if (file) {
+        status.textContent = `Selected: ${file.name}`;
+        handleFile(file);
+      }
+    });
+
+    const chooseBtn = document.getElementById('chooseBtn');
+    if (chooseBtn) chooseBtn.addEventListener('click', () => fileInput.click());
+
+    ['dragenter', 'dragover'].forEach(evt => {
+      dropzone.addEventListener(evt, e => {
+        e.preventDefault();
+        e.stopPropagation();
+        dropzone.classList.add('dragover');
+      });
+    });
+
+    ['dragleave', 'drop'].forEach(evt => {
+      dropzone.addEventListener(evt, e => {
+        e.preventDefault();
+        e.stopPropagation();
+        dropzone.classList.remove('dragover');
+      });
+    });
+
+    dropzone.addEventListener('drop', e => {
+      const file = e.dataTransfer?.files?.[0];
+      if (file) handleFile(file);
+    });
+
+    downloadBtn.addEventListener('click', () => {
+      if (!latestCsv) return;
+      downloadCsv(latestFileName, latestCsv);
+      status.textContent = 'CSV downloaded.';
+    });
+
+    async function handleFile(file) {
+      if (!file.name.toLowerCase().endsWith('.pdf')) {
+        alert('Please select a PDF file.');
+        return;
+      }
+
+      if (typeof pdfjsLib === 'undefined') {
+        const loaded = await ensurePdfJsLoaded();
+        if (!loaded) {
+          const msg = 'PDF library failed to load from all CDNs. Check network/proxy rules.';
+          preview.value = msg;
+          status.textContent = msg;
+          return;
+        }
+      }
+
+      latestFileName = file.name.replace(/\.pdf$/i, '') + '.csv';
+      preview.value = 'Reading PDF...';
+      status.textContent = 'Reading PDF...';
+      downloadBtn.disabled = true;
+      latestCsv = '';
+
+      try {
+        const text = await extractTextFromPdf(file);
+        const sectionText = extractTextBelowHeading(text, 'Performance Checking Statement');
+        const rawRows = toRawLineRows(sectionText);
+
+        if (!rawRows.length) {
+          preview.value = 'No lines found below "Performance Checking Statement".';
+          status.textContent = 'No rows exported. Check the heading text in the statement.';
+          return;
+        }
+
+        latestCsv = toRawCsv(rawRows);
+        preview.value = latestCsv;
+        status.textContent = `Exported ${rawRows.length} lines below "Performance Checking Statement".`;
+
+        downloadBtn.disabled = false;
+        downloadCsv(latestFileName, latestCsv);
+      } catch (err) {
+        console.error(err);
+        const msg = 'Failed to parse PDF: ' + err.message;
+        preview.value = msg;
+        status.textContent = msg;
+      }
+    }
+
+    async function extractTextFromPdf(file) {
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      const pdf = await pdfjsLib.getDocument({ data: bytes }).promise;
+
+      const lines = [];
+      for (let p = 1; p <= pdf.numPages; p++) {
+        const page = await pdf.getPage(p);
+        const content = await page.getTextContent();
+
+        const grouped = new Map();
+        for (const item of content.items) {
+          const y = Math.round(item.transform[5]);
+          if (!grouped.has(y)) grouped.set(y, []);
+          grouped.get(y).push(item);
+        }
+
+        const ys = [...grouped.keys()].sort((a, b) => b - a);
+        for (const y of ys) {
+          const row = grouped.get(y)
+            .sort((a, b) => a.transform[4] - b.transform[4])
+            .map(i => i.str)
+            .join(' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+          if (row) lines.push(row);
+        }
+      }
+
+      return lines.join('\n');
+    }
+
+    function extractTextBelowHeading(text, heading) {
+      const lines = String(text || '').split(/\r?\n/);
+      const headingLower = String(heading || '').toLowerCase();
+      const idx = lines.findIndex(line => line.toLowerCase().includes(headingLower));
+      if (idx === -1) return text;
+      return lines.slice(idx + 1).join('\n');
+    }
+
+    function parseTransactions(text) {
+      const rows = [];
+      const lines = text.split(/\r?\n/);
+
+      // Common statement date formats
+      const datePart = '(?:\\d{1,2}[/-]\\d{1,2}(?:[/-]\\d{2,4})?|\\d{1,2}\\s+[A-Za-z]{3,9}\\s+\\d{2,4}|[A-Za-z]{3,9}\\s+\\d{1,2},\\s*\\d{4})';
+      const amountPart = '(?:[-+]?\\$?\\d{1,3}(?:,\\d{3})*(?:\\.\\d{2})|\\(\\$?\\d{1,3}(?:,\\d{3})*(?:\\.\\d{2})\\))(?:\\s*(?:CR|DR))?';
+
+      // Date Description Amount [Balance]
+      const txnRegex = new RegExp(
+        `^\\s*(${datePart})\\s+(.+?)\\s+(${amountPart})(?:\\s+(${amountPart}))?\\s*$`,
+        'i'
+      );
+
+      for (const line of lines) {
+        const m = line.match(txnRegex);
+        if (!m) continue;
+
+        const date = normalizeDate(m[1]);
+        const description = m[2].trim();
+        const amount = normalizeAmount(m[3]);
+        const balance = m[4] ? normalizeAmount(m[4]) : '';
+
+        rows.push({ date, description, amount, balance });
+      }
+
+      return rows;
+    }
+
+    function toRawLineRows(text) {
+      return text
+        .split(/\r?\n/)
+        .map(line => line.trim())
+        .filter(line => line.length > 0)
+        .map(line => ({ line }));
+    }
+
+    function toRawCsv(rows) {
+      const header = ['RawLine'];
+      const lines = [header.join(',')];
+      for (const r of rows) {
+        lines.push(csvEscape(r.line));
+      }
+      return lines.join('\n');
+    }
+
+    function normalizeAmount(v) {
+      let s = String(v).trim().toUpperCase();
+      const negByParens = s.startsWith('(') && s.endsWith(')');
+      const hasDr = /\bDR\b/.test(s);
+      const hasCr = /\bCR\b/.test(s);
+      s = s.replace(/[,$()\s]|\bCR\b|\bDR\b/g, '');
+      if ((negByParens || hasDr) && !s.startsWith('-')) s = '-' + s;
+      if (hasCr && s.startsWith('-')) s = s.slice(1);
+      return s;
+    }
+
+    function normalizeDate(v) {
+      return String(v).replace(/\s+/g, ' ').trim();
+    }
+
+    function csvEscape(v) {
+      const s = String(v ?? '');
+      return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+    }
+
+    function downloadCsv(fileName, csvText) {
+      const blob = new Blob([csvText], { type: 'text/csv;charset=utf-8;' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = fileName || 'statement.csv';
+      a.click();
+      URL.revokeObjectURL(url);
+    }
+
+    function toCsv(rows) {
+      const header = ['Date', 'Description', 'Amount', 'Balance'];
+      const lines = [header.join(',')];
+      for (const r of rows) {
+        lines.push([
+          csvEscape(r.date),
+          csvEscape(r.description),
+          csvEscape(r.amount),
+          csvEscape(r.balance)
+        ].join(','));
+      }
+      return lines.join('\n');
+    }
+  </script>
+</body>
+</html>
