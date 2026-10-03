@@ -25,16 +25,16 @@
 </head>
 <body>
   <h1>PDF Bank Statement to CSV</h1>
-  <p>Drop a statement PDF below. The parser extracts lines that look like: <b>Date Description Amount [Balance]</b>.</p>
+  <p>Drop one or more statement PDFs below. The parser extracts lines that look like: <b>Date Description Amount [Balance]</b>.</p>
 
     <div id="dropzone" class="dropzone">
-    <p><b>Drop PDF here</b> or click to choose</p>
+    <p><b>Drop PDF(s) here</b> or click to choose</p>
     <!-- Invisible native input overlays the dropzone so clicks reliably open the file chooser -->
-    <input id="fileInput" type="file" accept="application/pdf" style="position:absolute;top:0;left:0;width:100%;height:100%;opacity:0;cursor:pointer;" />
+    <input id="fileInput" type="file" accept="application/pdf" multiple style="position:absolute;top:0;left:0;width:100%;height:100%;opacity:0;cursor:pointer;" />
     <small>No data leaves your machine. Processing is in-browser.</small>
   </div>
   <div style="margin-top:8px">
-    <button id="chooseBtn">Choose file</button>
+    <button id="chooseBtn">Choose file(s)</button>
   </div>
 
   <div class="row">
@@ -56,6 +56,8 @@
 
     let latestCsv = '';
     let latestFileName = 'statement.csv';
+    let latestPdfHandle = null;
+    let outputDirectoryHandle = null;
 
     const pdfLibCandidates = [
       {
@@ -106,17 +108,30 @@
     window.addEventListener('dragover', e => { e.preventDefault(); e.stopPropagation(); });
     window.addEventListener('drop', e => { e.preventDefault(); e.stopPropagation(); });
 
-    dropzone.addEventListener('click', () => { console.log('dropzone clicked'); fileInput.click(); });
-    fileInput.addEventListener('change', e => {
-      const file = e.target.files?.[0];
-      if (file) {
-        status.textContent = `Selected: ${file.name}`;
-        handleFile(file);
+    dropzone.addEventListener('click', () => fileInput.click());
+    fileInput.addEventListener('change', async e => {
+      const files = Array.from(e.target.files || []).filter(f => f.name.toLowerCase().endsWith('.pdf'));
+      if (files.length) {
+        latestPdfHandle = null;
+        status.textContent = `Selected ${files.length} file(s).`;
+        await handleFiles(files.map(file => ({ file, handle: null })));
       }
+      fileInput.value = '';
     });
 
     const chooseBtn = document.getElementById('chooseBtn');
-    if (chooseBtn) chooseBtn.addEventListener('click', () => fileInput.click());
+    if (chooseBtn) {
+      chooseBtn.addEventListener('click', async () => {
+        const picked = await pickPdfsWithHandles();
+        if (picked?.length) {
+          await ensureOutputDirectoryHandle(picked[0].handle);
+          status.textContent = `Selected ${picked.length} file(s).`;
+          await handleFiles(picked);
+          return;
+        }
+        fileInput.click();
+      });
+    }
 
     ['dragenter', 'dragover'].forEach(evt => {
       dropzone.addEventListener(evt, e => {
@@ -134,21 +149,64 @@
       });
     });
 
-    dropzone.addEventListener('drop', e => {
-      const file = e.dataTransfer?.files?.[0];
-      if (file) handleFile(file);
+    dropzone.addEventListener('drop', async e => {
+      const files = Array.from(e.dataTransfer?.files || []).filter(f => f.name.toLowerCase().endsWith('.pdf'));
+      if (files.length) {
+        latestPdfHandle = null;
+        status.textContent = `Dropped ${files.length} file(s).`;
+        await handleFiles(files.map(file => ({ file, handle: null })));
+      }
     });
 
-    downloadBtn.addEventListener('click', () => {
+    downloadBtn.addEventListener('click', async () => {
       if (!latestCsv) return;
-      downloadCsv(latestFileName, latestCsv);
-      status.textContent = 'CSV downloaded.';
+
+      const savedToPdfFolder = await saveCsvNearSourcePdf(latestFileName, latestCsv);
+      if (savedToPdfFolder) {
+        status.textContent = `CSV saved as ${latestFileName} (same folder as the selected PDF).`;
+      } else {
+        downloadCsv(latestFileName, latestCsv);
+        status.textContent = 'CSV downloaded.';
+      }
     });
 
-    async function handleFile(file) {
+    async function handleFiles(entries) {
+      if (!entries?.length) return;
+
+      let converted = 0;
+      let autoSavedCount = 0;
+      let noRowsCount = 0;
+      const totalsRows = [];
+
+      for (let i = 0; i < entries.length; i++) {
+        const entry = entries[i]?.file ? entries[i] : { file: entries[i], handle: null };
+        if (entry.handle) latestPdfHandle = entry.handle;
+
+        const result = await handleFile(entry.file, i + 1, entries.length);
+        if (result.success) {
+          converted++;
+          if (result.autoSaved) autoSavedCount++;
+          totalsRows.push({
+            fileName: result.fileName,
+            month: result.monthLabel,
+            totalNegative: result.negativeTotal
+          });
+        } else if (result.noRows) {
+          noRowsCount++;
+        }
+      }
+
+      const totalsSaved = await saveTotalsCsvReport(totalsRows);
+      if (entries.length > 1 || totalsRows.length) {
+        const totalsPart = totalsRows.length ? (totalsSaved ? ' total.csv saved.' : ' total.csv downloaded.') : '';
+        status.textContent = `Processed ${entries.length} file(s): ${converted} converted, ${noRowsCount} with no rows, ${autoSavedCount} auto-saved.${totalsPart}`;
+      }
+    }
+
+    async function handleFile(file, currentIndex = 1, totalFiles = 1) {
       if (!file.name.toLowerCase().endsWith('.pdf')) {
         alert('Please select a PDF file.');
-        return;
+        return { success: false, autoSaved: false, noRows: false };
       }
 
       if (typeof pdfjsLib === 'undefined') {
@@ -157,13 +215,13 @@
           const msg = 'PDF library failed to load from all CDNs. Check network/proxy rules.';
           preview.value = msg;
           status.textContent = msg;
-          return;
+          return { success: false, autoSaved: false, noRows: false };
         }
       }
 
       latestFileName = file.name.replace(/\.pdf$/i, '') + '.csv';
-      preview.value = 'Reading PDF...';
-      status.textContent = 'Reading PDF...';
+      preview.value = `Reading PDF (${currentIndex}/${totalFiles})...`;
+      status.textContent = `Reading ${file.name} (${currentIndex}/${totalFiles})...`;
       downloadBtn.disabled = true;
       latestCsv = '';
 
@@ -172,22 +230,113 @@
         const txnRows = toDateAmountDescriptionRows(toRawLineRows(text));
 
         if (!txnRows.length) {
-          preview.value = 'No Date/Amount/Description transaction rows were found.';
-          status.textContent = 'No matching transaction rows exported.';
-          return;
+          preview.value = `No Date/Amount/Description transaction rows were found for ${file.name}.`;
+          status.textContent = `No matching transaction rows exported for ${file.name}.`;
+          return { success: false, autoSaved: false, noRows: true };
         }
 
-        latestCsv = toRawCsv(txnRows);
+        const negativeTotal = sumNegativeAmounts(txnRows);
+        const monthLabel = getFileMonthLabel(txnRows);
+        latestCsv = toRawCsv(txnRows, negativeTotal, monthLabel);
         preview.value = latestCsv;
-        status.textContent = `Exported ${txnRows.length} transaction rows (Date, Amount, Description).`;
+
+        const autoSaved = await autoSaveCsvToOutputDirectory(latestFileName, latestCsv);
+        if (autoSaved) {
+          status.textContent = `Exported ${txnRows.length} rows from ${file.name}. ${monthLabel} negative total: ${negativeTotal.toFixed(2)}. Auto-saved to PDF folder.`;
+        } else {
+          status.textContent = `Exported ${txnRows.length} rows from ${file.name}. ${monthLabel} negative total: ${negativeTotal.toFixed(2)}.`;
+        }
 
         downloadBtn.disabled = false;
-        downloadCsv(latestFileName, latestCsv);
+        return {
+          success: true,
+          autoSaved,
+          noRows: false,
+          fileName: file.name,
+          monthLabel,
+          negativeTotal
+        };
       } catch (err) {
         console.error(err);
-        const msg = 'Failed to parse PDF: ' + err.message;
+        const msg = `Failed to parse ${file.name}: ${err.message}`;
         preview.value = msg;
         status.textContent = msg;
+        return { success: false, autoSaved: false, noRows: false };
+      }
+    }
+
+    async function pickPdfsWithHandles() {
+      if (typeof window.showOpenFilePicker !== 'function') return null;
+
+      try {
+        const handles = await window.showOpenFilePicker({
+          multiple: true,
+          types: [{
+            description: 'PDF Files',
+            accept: { 'application/pdf': ['.pdf'] }
+          }]
+        });
+
+        if (!handles?.length) return null;
+
+        const picked = [];
+        for (const handle of handles) {
+          const file = await handle.getFile();
+          picked.push({ file, handle });
+        }
+
+        latestPdfHandle = picked[picked.length - 1].handle;
+        return picked;
+      } catch (err) {
+        if (err?.name === 'AbortError') return null;
+        return null;
+      }
+    }
+
+    async function ensureOutputDirectoryHandle(startHandle) {
+      if (typeof window.showDirectoryPicker !== 'function') return false;
+      try {
+        outputDirectoryHandle = await window.showDirectoryPicker({ mode: 'readwrite', startIn: startHandle || 'documents' });
+        return !!outputDirectoryHandle;
+      } catch {
+        return false;
+      }
+    }
+
+    async function autoSaveCsvToOutputDirectory(fileName, csvText) {
+      if (!outputDirectoryHandle) return false;
+      try {
+        const fileHandle = await outputDirectoryHandle.getFileHandle(fileName, { create: true });
+        const writable = await fileHandle.createWritable();
+        await writable.write(csvText);
+        await writable.close();
+        return true;
+      } catch {
+        return false;
+      }
+    }
+
+    async function saveCsvNearSourcePdf(fileName, csvText) {
+      if (await autoSaveCsvToOutputDirectory(fileName, csvText)) return true;
+      if (!latestPdfHandle || typeof window.showSaveFilePicker !== 'function') return false;
+
+      try {
+        const saveHandle = await window.showSaveFilePicker({
+          suggestedName: fileName,
+          startIn: latestPdfHandle,
+          types: [{
+            description: 'CSV Files',
+            accept: { 'text/csv': ['.csv'] }
+          }]
+        });
+
+        const writable = await saveHandle.createWritable();
+        await writable.write(csvText);
+        await writable.close();
+        return true;
+      } catch (err) {
+        if (err?.name === 'AbortError') return false;
+        return false;
       }
     }
 
@@ -397,7 +546,7 @@
       return out;
     }
 
-    function toRawCsv(rows) {
+    function toRawCsv(rows, negativeTotal = 0, monthLabel = 'Unknown') {
       const header = ['Date', 'Amount', 'Description'];
       const lines = [header.join(',')];
       for (const r of rows) {
@@ -407,6 +556,12 @@
           csvEscape(r.description)
         ].join(','));
       }
+      lines.push('');
+      lines.push([
+        csvEscape(`Total Negative (${monthLabel})`),
+        csvEscape(negativeTotal.toFixed(2)),
+        ''
+      ].join(','));
       return lines.join('\n');
     }
 
@@ -443,12 +598,73 @@
 
       const transferHints = /transfer\s+(?:to|from)|online\s+transfer|zel\s+to|zel\s+from/i;
       const positiveHints = /(deposit|interest\s+payment|reimbursement|refund|credit)/i;
-      const negativeHints = /(withdrawal|transaction\s+fee|fee\b|charge\b|web\s+pmt|payment|purchase|debit|bill\s+pay)/i;
+      const negativeHints = /(withdrawal|transaction\s+fee|fee\b|charge\b|web\s+pmt|\bpmt\b|payment|purchase|debit|bill\s+pay)/i;
 
       if (transferHints.test(desc)) return absAmt;
       if (positiveHints.test(desc)) return absAmt;
       if (negativeHints.test(desc)) return '-' + absAmt;
       return amt;
+    }
+
+    function sumNegativeAmounts(rows) {
+      return rows.reduce((sum, row) => {
+        const n = Number.parseFloat(String(row?.amount || '').replace(/,/g, ''));
+        if (Number.isFinite(n) && n < 0) return sum + n;
+        return sum;
+      }, 0);
+    }
+
+    function getFileMonthLabel(rows) {
+      const monthNames = [
+        'january', 'february', 'march', 'april', 'may', 'june',
+        'july', 'august', 'september', 'october', 'november', 'december'
+      ];
+      const counts = new Map();
+
+      for (const row of rows || []) {
+        const dateText = String(row?.date || '').trim();
+        if (!dateText) continue;
+
+        let label = '';
+        const numeric = dateText.match(/^(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?/);
+        if (numeric) {
+          const month = Number.parseInt(numeric[1], 10);
+          if (month >= 1 && month <= 12) {
+            const mm = String(month).padStart(2, '0');
+            let year = numeric[3] ? String(numeric[3]) : '';
+            if (year.length === 2) year = `20${year}`;
+            label = year ? `${mm}-${year}` : mm;
+          }
+        }
+
+        if (!label) {
+          const named = dateText.match(/^([A-Za-z]{3,9})\s+\d{1,2},?\s*(\d{2,4})?/);
+          if (named) {
+            const monthPart = named[1].toLowerCase();
+            const monthIndex = monthNames.findIndex(m => m.startsWith(monthPart));
+            if (monthIndex >= 0) {
+              const mm = String(monthIndex + 1).padStart(2, '0');
+              let year = named[2] ? String(named[2]) : '';
+              if (year.length === 2) year = `20${year}`;
+              label = year ? `${mm}-${year}` : mm;
+            }
+          }
+        }
+
+        if (!label) continue;
+        counts.set(label, (counts.get(label) || 0) + 1);
+      }
+
+      let bestLabel = 'Unknown';
+      let bestCount = 0;
+      for (const [label, count] of counts) {
+        if (count > bestCount) {
+          bestLabel = label;
+          bestCount = count;
+        }
+      }
+
+      return bestLabel;
     }
 
     function normalizeDate(v) {
@@ -458,6 +674,27 @@
     function csvEscape(v) {
       const s = String(v ?? '');
       return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+    }
+
+    function toTotalsCsv(rows) {
+      const lines = [['File', 'Month', 'Total Negative'].join(',')];
+      for (const row of rows || []) {
+        lines.push([
+          csvEscape(row.fileName || ''),
+          csvEscape(row.month || 'Unknown'),
+          csvEscape(Number(row.totalNegative || 0).toFixed(2))
+        ].join(','));
+      }
+      return lines.join('\n');
+    }
+
+    async function saveTotalsCsvReport(rows) {
+      if (!rows?.length) return false;
+      const csv = toTotalsCsv(rows);
+      const fileName = 'total.csv';
+      if (await autoSaveCsvToOutputDirectory(fileName, csv)) return true;
+      downloadCsv(fileName, csv);
+      return false;
     }
 
     function downloadCsv(fileName, csvText) {
